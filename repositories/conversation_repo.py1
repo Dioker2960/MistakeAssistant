@@ -1,0 +1,134 @@
+import json
+import logging
+from datetime import datetime
+
+from core.redis_client import get_client
+
+# 会话过期时间：1 小时
+TTL_SECONDS = 3600
+
+# Key 前缀
+_KEY_PREFIX = "conversation:"
+
+logger = logging.getLogger(__name__)
+
+
+def _key(user_id: str, conversation_id: str) -> str:
+    """根据 conversation_id 生成 Redis key。"""
+    return f"conversation:{user_id}:{conversation_id}"
+
+
+def _convs_key(user_id: str) -> str:
+    """用户所有会话 ID 的 Set key。"""
+    return f"user_conversations:{user_id}"
+
+
+def get_messages(user_id: str, conversation_id: str) -> list[dict]:
+    """
+    读取会话的历史消息列表。
+    不存在则返回空列表 []。
+    """
+    client = get_client()
+    # TODO 1: 用 client.get(_key(conversation_id)) 读字符串
+    result = client.get(_key(user_id, conversation_id))
+    # TODO 2: 如果结果是 None，直接 return []
+    if result is None:
+        logger.debug("Redis 读会话: id=%s, 不存在", conversation_id)
+        return []
+    # TODO 3: 用 json.loads 解析
+    result = json.loads(result)
+    # TODO 4: 返回 data["messages"]
+    logger.debug("Redis 读会话: id=%s, %d 条消息", conversation_id, len(result["messages"]))
+    return result["messages"]
+
+
+def append_messages(user_id: str, conversation_id: str, new_messages: list[dict]) -> None:
+    """
+    把新消息追加到会话历史。
+    如果会话不存在，自动创建。
+    同时刷新 TTL。
+    """
+    client = get_client()
+    key = _key(user_id, conversation_id)
+
+    # TODO 1: 读取现有的数据（不要直接调 get_messages，因为你还想知道 created_at）
+    #         提示：client.get(key) 拿到字符串，为 None 说明是新会话
+    result = client.get(key)
+    # TODO 2: 如果是新会话：
+    #         - created_at 用 datetime.now().isoformat()
+    #         - messages 从空列表开始
+    #         如果是已有会话：
+    #         - json.loads 解析，保留原 created_at 和 messages
+    if result is None:
+        # 不存在已有数据
+        messages = list(new_messages)
+        created_at = datetime.now().isoformat()
+    # TODO 3: 把 new_messages 追加到 messages 后面（用列表的 extend 或 +=）
+    else:
+        # 已有数据
+        data = json.loads(result)
+        messages = data["messages"]
+        messages.extend(new_messages)
+        created_at = data["created_at"]
+    # TODO 4: 构造完整数据 dict：
+    #         {"messages": [...], "created_at": ..., "updated_at": ...}
+    #         updated_at 用 datetime.now().isoformat()
+    data = {
+        "messages": messages,
+        "created_at": created_at,
+        "updated_at": datetime.now().isoformat(),
+    }
+    # TODO 5: json.dumps 序列化，用 client.setex(key, expire, value) 写入并刷新过期时间
+    client.setex(key, TTL_SECONDS, json.dumps(data))
+
+    # ← 新增：把 conv_id 加入用户的会话 Set
+    client.sadd(_convs_key(user_id), conversation_id)
+
+
+def delete_conversation(user_id: str, conversation_id: str) -> bool:
+    """删除整个会话，返回是否删除成功。"""
+    client = get_client()
+    # TODO: 用 client.delete(key)，返回值 > 0 表示删掉了东西
+    deleted = client.delete(_key(user_id, conversation_id))
+    client.srem(_convs_key(user_id), conversation_id)  
+    return deleted > 0
+
+
+def list_conversations(user_id: str) -> list[dict]:
+    """
+    列出用户的所有会话。
+    返回：[{conversation_id, title, updated_at, message_count}, ...]，按时间倒序。
+    """
+    client = get_client()
+    conv_ids = client.smembers(_convs_key(user_id))
+
+    result = []
+    for conv_id in conv_ids:
+        raw = client.get(_key(user_id, conv_id))
+        if raw is None:
+            # key 已过期，从 Set 里清掉
+            client.srem(_convs_key(user_id), conv_id)
+            continue
+
+        data = json.loads(raw)
+        messages = data.get("messages", [])
+
+        # 标题：第一条用户消息的前 20 字
+        title = "新会话"
+        for m in messages:
+            if m["role"] == "user":
+                title = m["content"][:20]
+                if len(m["content"]) > 20:
+                    title += "..."
+                break
+
+        result.append({
+            "conversation_id": conv_id,
+            "title": title,
+            "updated_at": data.get("updated_at", ""),
+            "message_count": len(messages),
+        })
+
+    # 按 updated_at 倒序
+    result.sort(key=lambda x: x["updated_at"], reverse=True)
+    return result
